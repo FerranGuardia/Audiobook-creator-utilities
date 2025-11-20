@@ -35,6 +35,12 @@ function AllInOneView({ onBack }) {
   })
   const [logs, setLogs] = useState(['Ready to start. Configure settings and click "Start Processing".'])
   const [audioFiles, setAudioFiles] = useState([])
+  const [showFolderDialog, setShowFolderDialog] = useState(false)
+  const [folderInfo, setFolderInfo] = useState(null)
+  const [projects, setProjects] = useState([])
+  const [showProjects, setShowProjects] = useState(false)
+  const [showCleanupDialog, setShowCleanupDialog] = useState(false)
+  const [cleanupInfo, setCleanupInfo] = useState(null)
 
   // Load URL history
   useEffect(() => {
@@ -56,6 +62,44 @@ function AllInOneView({ onBack }) {
   useEffect(() => {
     loadVoices()
   }, [])
+
+  // Load projects on mount and check for paused/interrupted projects
+  useEffect(() => {
+    loadProjects()
+    checkForPausedProjects()
+  }, [])
+
+  const checkForPausedProjects = async () => {
+    try {
+      const response = await fetch('http://127.0.0.1:8000/api/list-projects')
+      if (response.ok) {
+        const data = await response.json()
+        const pausedProjects = (data.projects || []).filter(
+          p => p.status === 'paused' || p.status === 'processing'
+        )
+        if (pausedProjects.length > 0) {
+          addLog(`ℹ️ Found ${pausedProjects.length} project(s) that can be resumed`)
+          pausedProjects.forEach(project => {
+            addLog(`   - ${project.novel_name}: ${project.progress.completed}/${project.progress.total} chapters (${project.progress.percentage}%)`)
+          })
+        }
+      }
+    } catch (error) {
+      console.error('Error checking for paused projects:', error)
+    }
+  }
+
+  const loadProjects = async () => {
+    try {
+      const response = await fetch('http://127.0.0.1:8000/api/list-projects')
+      if (response.ok) {
+        const data = await response.json()
+        setProjects(data.projects || [])
+      }
+    } catch (error) {
+      console.error('Error loading projects:', error)
+    }
+  }
 
   const loadVoices = async () => {
     try {
@@ -97,7 +141,7 @@ function AllInOneView({ onBack }) {
     setLogs(['Log cleared.'])
   }
 
-  const handleStartProcessing = async () => {
+  const handleStartProcessing = async (overwrite = false) => {
     if (!baseUrl.trim() && !startUrl.trim()) {
       addLog('❌ Please enter URLs')
       return
@@ -134,6 +178,32 @@ function AllInOneView({ onBack }) {
       return
     }
 
+    // Check if folder exists first
+    try {
+      const checkResponse = await fetch('http://127.0.0.1:8000/api/check-novel-folder', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          base_url: baseUrl.trim() || undefined,
+          start_url: startUrl.trim() || baseUrl.trim(),
+        }),
+      })
+
+      if (checkResponse.ok) {
+        const folderInfo = await checkResponse.json()
+        setFolderInfo(folderInfo)
+        
+        if (folderInfo.exists && !overwrite) {
+          setShowFolderDialog(true)
+          return
+        }
+      }
+    } catch (error) {
+      console.error('Error checking folder:', error)
+    }
+
     // Save URLs
     saveUrlToHistory(baseUrl.trim(), startUrl.trim())
 
@@ -150,6 +220,10 @@ function AllInOneView({ onBack }) {
 
     addLog('='.repeat(60))
     addLog('🚀 Starting All-in-One Processing')
+    if (folderInfo) {
+      addLog(`📁 Novel: ${folderInfo.novel_name}`)
+      addLog(`📂 Folder: ${folderInfo.folder_path}`)
+    }
     addLog(`Base URL: ${baseUrl || 'Not specified'}`)
     addLog(`Start URL: ${startUrl || baseUrl}`)
     addLog(`Chapters: ${start} to ${end || (start + num - 1)}`)
@@ -158,7 +232,7 @@ function AllInOneView({ onBack }) {
     addLog('='.repeat(60))
 
     try {
-      const response = await fetch('http://127.0.0.1:8000/api/process-all-in-one', {
+      const response = await fetch(`http://127.0.0.1:8000/api/process-all-in-one?overwrite=${overwrite}`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -179,7 +253,16 @@ function AllInOneView({ onBack }) {
 
       if (!response.ok) {
         const error = await response.json()
+        if (error.detail && error.detail.includes('already exists')) {
+          setShowFolderDialog(true)
+          return
+        }
         throw new Error(error.detail || 'Error starting processing')
+      }
+
+      const data = await response.json()
+      if (data.novel_name) {
+        addLog(`📁 Novel folder: ${data.folder_path}`)
       }
 
       // Start polling for progress
@@ -213,6 +296,9 @@ function AllInOneView({ onBack }) {
             addLog('✅ Processing completed!')
             addLog(`📁 Generated ${status.completedBatches} audio file(s)`)
             
+            // Reload projects
+            loadProjects()
+            
             // Get list of generated files
             try {
               const filesResponse = await fetch('http://127.0.0.1:8000/api/list-audio-files')
@@ -224,10 +310,33 @@ function AllInOneView({ onBack }) {
             } catch (e) {
               console.error('Error getting file list:', e)
             }
+            
+            // Show cleanup dialog
+            try {
+              const cleanupResponse = await fetch('http://127.0.0.1:8000/api/clean-temporary-files', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                  novel_name: folderInfo?.novel_name
+                })
+              })
+              if (cleanupResponse.ok) {
+                const cleanupData = await cleanupResponse.json()
+                if (cleanupData.files_deleted > 0) {
+                  setCleanupInfo(cleanupData)
+                  setShowCleanupDialog(true)
+                }
+              }
+            } catch (e) {
+              console.error('Error checking cleanup:', e)
+            }
           } else if (status.status === 'error') {
             clearInterval(interval)
             setProcessing(false)
             addLog(`❌ Processing failed: ${status.error || 'Unknown error'}`)
+            loadProjects() // Reload to show error state
           }
         }
       } catch (error) {
@@ -284,8 +393,124 @@ function AllInOneView({ onBack }) {
     window.open(`http://127.0.0.1:8000/api/download-audio/${filename}`, '_blank')
   }
 
+  const handleResumeProject = async (projectId) => {
+    try {
+      const response = await fetch('http://127.0.0.1:8000/api/resume-project', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ project_id: projectId }),
+      })
+
+      if (!response.ok) {
+        const error = await response.json()
+        throw new Error(error.detail || 'Error resuming project')
+      }
+
+      const data = await response.json()
+      addLog(`▶️ Resuming project: ${data.novel_name}`)
+      setProcessing(true)
+      setPaused(false)
+      pollProgress()
+    } catch (error) {
+      addLog(`❌ Error: ${error.message}`)
+    }
+  }
+
+  const handleCleanupTemporaries = async () => {
+    try {
+      const response = await fetch('http://127.0.0.1:8000/api/clean-temporary-files', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          novel_name: folderInfo?.novel_name
+        })
+      })
+
+      if (response.ok) {
+        const data = await response.json()
+        addLog(`✅ Cleaned ${data.files_deleted} temporary files`)
+        addLog(`💾 Space freed: ${data.space_freed_mb} MB`)
+        setShowCleanupDialog(false)
+        setCleanupInfo(null)
+      }
+    } catch (error) {
+      addLog(`❌ Error cleaning: ${error.message}`)
+    }
+  }
+
   return (
     <div className="allinone-view">
+      {/* Folder Exists Dialog */}
+      {showFolderDialog && folderInfo && (
+        <div className="dialog-overlay" onClick={() => setShowFolderDialog(false)}>
+          <div className="dialog-content" onClick={(e) => e.stopPropagation()}>
+            <h3>⚠️ Novel Folder Already Exists</h3>
+            <p><strong>Novel:</strong> {folderInfo.novel_name}</p>
+            <p><strong>Folder:</strong> {folderInfo.folder_path}</p>
+            <p className="dialog-warning">
+              A folder with this novel name already exists. Continuing will use the existing folder and resume from where it left off.
+            </p>
+            <div className="dialog-buttons">
+              <button
+                className="btn-cancel"
+                onClick={() => {
+                  setShowFolderDialog(false)
+                  setFolderInfo(null)
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                className="btn-continue"
+                onClick={() => {
+                  setShowFolderDialog(false)
+                  handleStartProcessing(true)
+                }}
+              >
+                Continue Anyway
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Cleanup Dialog */}
+      {showCleanupDialog && cleanupInfo && (
+        <div className="dialog-overlay" onClick={() => setShowCleanupDialog(false)}>
+          <div className="dialog-content" onClick={(e) => e.stopPropagation()}>
+            <h3>🧹 Clean Temporary Files?</h3>
+            <p>The processing has completed successfully.</p>
+            <div className="cleanup-info">
+              <p><strong>Temporary files found:</strong> {cleanupInfo.files_deleted}</p>
+              <p><strong>Space to free:</strong> {cleanupInfo.space_freed_mb} MB</p>
+            </div>
+            <p className="dialog-warning">
+              These are temporary chapter files that were already combined into batch files. Safe to delete.
+            </p>
+            <div className="dialog-buttons">
+              <button
+                className="btn-cancel"
+                onClick={() => {
+                  setShowCleanupDialog(false)
+                  setCleanupInfo(null)
+                }}
+              >
+                Keep Files
+              </button>
+              <button
+                className="btn-continue"
+                onClick={handleCleanupTemporaries}
+              >
+                Clean Up
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       <div className="allinone-header">
         <button className="btn-back" onClick={onBack}>
           ← Back to Home
@@ -466,6 +691,60 @@ function AllInOneView({ onBack }) {
             ))}
           </div>
         </div>
+
+        {/* Projects Section */}
+        {projects.length > 0 && (
+          <div className="projects-section">
+            <div className="projects-header">
+              <h3>📚 My Projects ({projects.length})</h3>
+              <button
+                className="btn-toggle-projects"
+                onClick={() => setShowProjects(!showProjects)}
+              >
+                {showProjects ? '▼ Hide' : '▶ Show'} Projects
+              </button>
+            </div>
+            {showProjects && (
+              <div className="projects-list">
+                {projects.map((project) => (
+                  <div key={project.project_id} className="project-card">
+                    <div className="project-info">
+                      <h4>{project.novel_name}</h4>
+                      <div className="project-progress">
+                        <div className="progress-bar-mini">
+                          <div
+                            className="progress-fill-mini"
+                            style={{ width: `${project.progress.percentage}%` }}
+                          />
+                        </div>
+                        <span>{project.progress.completed} / {project.progress.total} chapters ({project.progress.percentage}%)</span>
+                      </div>
+                      <div className="project-meta">
+                        <span>Status: {project.status}</span>
+                        <span>Updated: {new Date(project.last_updated).toLocaleDateString()}</span>
+                      </div>
+                    </div>
+                    <div className="project-actions">
+                      {project.status === 'paused' || project.status === 'processing' ? (
+                        <button
+                          className="btn-resume-project"
+                          onClick={() => handleResumeProject(project.project_id)}
+                          disabled={processing}
+                        >
+                          ▶️ Resume
+                        </button>
+                      ) : project.status === 'completed' ? (
+                        <span className="status-completed">✅ Completed</span>
+                      ) : (
+                        <span className="status-error">❌ Error</span>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Controls */}
         <div className="controls-section">
