@@ -525,3 +525,4 @@ function AllInOneView({ onBack }) {
 
 export default AllInOneView
 
+
